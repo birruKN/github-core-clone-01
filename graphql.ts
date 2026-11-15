@@ -12,6 +12,7 @@ import type { IncomingMessage, ServerResponse } from 'node:http';
 import {
   VIEWER,
   globalId,
+  invalidateIssueView,
   parseGlobalId,
   pullMergeable,
   squashMerge,
@@ -480,6 +481,7 @@ const FIELD_DEFS: Record<string, Record<string, FieldDef>> = {
         const found = typeof input.issueId === 'string' ? findIssueByGlobalId(ctx.forge, input.issueId) : null;
         if (!found) throw new Error('closeIssue: the issue id names no issue');
         found.issue.state = 'closed';
+        invalidateIssueView(found.issue);
         return { __typename: 'CloseIssuePayload', issue: issueSource(found.repo, found.issue) };
       },
     },
@@ -521,6 +523,7 @@ const FIELD_DEFS: Record<string, Record<string, FieldDef>> = {
         const body = typeof input.body === 'string' ? input.body : '';
         const comment = { id: ctx.forge.entityId(), body, seq: found.issue.comments.length };
         found.issue.comments.push(comment);
+        invalidateIssueView(found.issue);
         const node: Source = {
           __typename: 'Comment',
           id: globalId('Comment', `${found.repo.id}:${comment.id}`),

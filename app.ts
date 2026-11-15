@@ -21,9 +21,25 @@ function decode(segment: string): string {
 
 async function dispatch(forge: Forge, req: IncomingMessage, res: ServerResponse): Promise<void> {
   const method = req.method ?? 'GET';
-  const url = new URL(req.url ?? '/', 'http://entry');
-  const path = url.pathname;
-  const segments = path.split('/').filter((segment) => segment !== '').map(decode);
+  // Split the request target by hand: the WHATWG parser's only services here are the
+  // pathname/searchParams split, and URLSearchParams parses the query identically. Targets
+  // that are not canonical absolute paths (dot segments, backslashes, fragments, authority
+  // forms) still go through the real parser, whose normalization they may rely on.
+  const rawTarget = req.url ?? '/';
+  const queryIndex = rawTarget.indexOf('?');
+  let path = queryIndex < 0 ? rawTarget : rawTarget.slice(0, queryIndex);
+  let searchParams = new URLSearchParams(queryIndex < 0 ? '' : rawTarget.slice(queryIndex + 1));
+  if (
+    !rawTarget.startsWith('/') ||
+    rawTarget.startsWith('//') ||
+    path.includes('/.') ||
+    path.includes('\\') ||
+    path.includes('#')
+  ) {
+    const url = new URL(rawTarget, 'http://entry');
+    path = url.pathname;
+    searchParams = url.searchParams;
+  }
 
   // The env's boot check calls this twice: 200 {"ok":true}. No auth, by design.
   if (method === 'GET' && path === '/healthz') {
@@ -48,7 +64,17 @@ async function dispatch(forge: Forge, req: IncomingMessage, res: ServerResponse)
     return;
   }
 
-  if (segments[0] === 'api' && segments[1] === 'v3') {
+  // Decoded segments are only needed to route the REST surface, and only /api targets can
+  // reach it; git and the fixed paths above never pay for the split. Decoding is the
+  // identity for segments without a '%', so the call is skipped for those.
+  const segments = path.startsWith('/api')
+    ? path
+        .split('/')
+        .filter((segment) => segment !== '')
+        .map((segment) => (segment.includes('%') ? decode(segment) : segment))
+    : null;
+
+  if (segments !== null && segments[0] === 'api' && segments[1] === 'v3') {
     let json: Record<string, unknown> = {};
     if (body.length > 0) {
       try {
@@ -59,13 +85,13 @@ async function dispatch(forge: Forge, req: IncomingMessage, res: ServerResponse)
         return;
       }
     }
-    handleRest(forge, req, res, segments.slice(2), url.searchParams, json);
+    handleRest(forge, req, res, segments.slice(2), searchParams, json);
     return;
   }
 
   const gitMatch = /^\/([^/]+)\/([^/]+)\.git\/(info\/refs|git-upload-pack|git-receive-pack)$/.exec(path);
   if (gitMatch) {
-    handleGit(forge, req, res, decode(gitMatch[1]!), decode(gitMatch[2]!), gitMatch[3]!, url.searchParams, body);
+    handleGit(forge, req, res, decode(gitMatch[1]!), decode(gitMatch[2]!), gitMatch[3]!, searchParams, body);
     return;
   }
 

@@ -18,22 +18,38 @@ export function nextRequestId(): string {
 }
 
 export function sendJson(res: ServerResponse, status: number, body: unknown, headers: Readonly<Record<string, string>> = {}): void {
-  const text = `${JSON.stringify(body)}\n`;
+  const payload = Buffer.from(`${JSON.stringify(body)}\n`, 'utf8');
+  res.sendDate = false;
   res.writeHead(status, {
     'content-type': JSON_TYPE,
-    'content-length': Buffer.byteLength(text),
+    'content-length': payload.length,
     'x-github-request-id': nextRequestId(),
     ...headers,
   });
-  res.end(text);
+  res.end(payload);
+}
+
+/** Send an already-serialized JSON body (the exact bytes JSON.stringify would have produced). */
+export function sendJsonText(res: ServerResponse, status: number, text: string, headers: Readonly<Record<string, string>> = {}): void {
+  const payload = Buffer.from(`${text}\n`, 'utf8');
+  res.sendDate = false;
+  res.writeHead(status, {
+    'content-type': JSON_TYPE,
+    'content-length': payload.length,
+    'x-github-request-id': nextRequestId(),
+    ...headers,
+  });
+  res.end(payload);
 }
 
 export function sendEmpty(res: ServerResponse, status: number): void {
+  res.sendDate = false;
   res.writeHead(status, { 'x-github-request-id': nextRequestId() });
   res.end();
 }
 
 export function sendBytes(res: ServerResponse, status: number, body: Buffer, contentType: string): void {
+  res.sendDate = false;
   res.writeHead(status, {
     'content-type': contentType,
     'content-length': body.length,
@@ -44,20 +60,60 @@ export function sendBytes(res: ServerResponse, status: number, body: Buffer, con
 
 /** Read a whole request body (git packs included). Null when it grows past a generous cap. */
 export async function readBody(req: IncomingMessage, cap = 256 * 1024 * 1024): Promise<Buffer | null> {
-  const chunks: Buffer[] = [];
-  let size = 0;
-  for await (const chunk of req) {
-    const buffer = chunk as Buffer;
-    size += buffer.length;
-    if (size > cap) return null;
-    chunks.push(buffer);
-  }
-  return Buffer.concat(chunks);
+  return new Promise<Buffer | null>((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    let size = 0;
+    let settled = false;
+    const cleanup = (): void => {
+      req.removeListener('data', onData);
+      req.removeListener('end', onEnd);
+      req.removeListener('error', onError);
+      req.removeListener('aborted', onAborted);
+    };
+    const onData = (chunk: Buffer): void => {
+      size += chunk.length;
+      if (size > cap) {
+        settled = true;
+        cleanup();
+        req.destroy();
+        resolve(null);
+        return;
+      }
+      chunks.push(chunk);
+    };
+    const onEnd = (): void => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      resolve(chunks.length === 1 ? chunks[0]! : Buffer.concat(chunks));
+    };
+    const onError = (err: Error): void => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      reject(err);
+    };
+    const onAborted = (): void => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      reject(new Error('request aborted'));
+    };
+    req.on('data', onData);
+    req.on('end', onEnd);
+    req.on('error', onError);
+    req.on('aborted', onAborted);
+  });
 }
 
-/** The token the trial assigned this entry, or '' when the environment named none. */
+/** The token the trial assigned this entry, or '' when the environment named none. The
+ *  environment is fixed before the process starts, so the first read is cached for the
+ *  process's lifetime instead of being looked up on every request. */
+let expectedTokenCache: string | null = null;
+
 export function expectedToken(): string {
-  return process.env.MAKEFUN_SHOP_TOKEN ?? '';
+  if (expectedTokenCache === null) expectedTokenCache = process.env.MAKEFUN_SHOP_TOKEN ?? '';
+  return expectedTokenCache;
 }
 
 /** Whether the request carries a bearer token the forge accepts. */

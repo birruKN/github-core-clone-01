@@ -14,15 +14,16 @@ import { deflateSync, inflateSync } from 'node:zlib';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import {
   ZERO_OID,
-  ancestorSet,
   hashObject,
+  isAncestor,
   isOid,
-  parseCommit,
+  parseCommitCached,
   parseTag,
   parseTree,
   peelToCommit,
   reachableObjects,
   storeObject,
+  touchRefs,
   type Forge,
   type GitObject,
   type GitObjectType,
@@ -329,15 +330,18 @@ function v0Advertisement(repo: Repo, service: 'git-upload-pack' | 'git-receive-p
   return Buffer.concat(parts);
 }
 
+/** The v2 advertisement names no repository state, so its bytes are built once, ever. */
+const V2_ADVERTISEMENT: Buffer = Buffer.concat([
+  pktLine('version 2\n'),
+  pktLine(`agent=${AGENT}\n`),
+  pktLine('ls-refs=unborn\n'),
+  pktLine('fetch=shallow wait-for-done\n'),
+  pktLine('object-format=sha1\n'),
+  PKT_FLUSH,
+]);
+
 function v2Advertisement(): Buffer {
-  return Buffer.concat([
-    pktLine('version 2\n'),
-    pktLine(`agent=${AGENT}\n`),
-    pktLine('ls-refs=unborn\n'),
-    pktLine('fetch=shallow wait-for-done\n'),
-    pktLine('object-format=sha1\n'),
-    PKT_FLUSH,
-  ]);
+  return V2_ADVERTISEMENT;
 }
 
 interface LsRefsArgs {
@@ -347,6 +351,10 @@ interface LsRefsArgs {
 }
 
 function lsRefsReply(repo: Repo, args: LsRefsArgs): Buffer {
+  // The reply is a pure function of the ref set and the request's flags; the ref set changes
+  // only through touchRefs, so (refsVersion, flags, prefixes) is a sound cache key.
+  const cacheKey = `${repo.refsVersion}|${args.peel ? 1 : 0}${args.symrefs ? 1 : 0}|${args.prefixes.join(',')}`;
+  if (repo.lsRefsCache !== null && repo.lsRefsCache.key === cacheKey) return repo.lsRefsCache.body;
   const keep = (name: string): boolean => args.prefixes.length === 0 || args.prefixes.some((prefix) => name.startsWith(prefix));
   const parts: Buffer[] = [];
   const defaultRef = `refs/heads/${repo.defaultBranch}`;
@@ -365,7 +373,9 @@ function lsRefsReply(repo: Repo, args: LsRefsArgs): Buffer {
     parts.push(pktLine(`${line}\n`));
   }
   parts.push(PKT_FLUSH);
-  return Buffer.concat(parts);
+  const body = Buffer.concat(parts);
+  repo.lsRefsCache = { key: cacheKey, body };
+  return body;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -403,9 +413,11 @@ function heldObjects(repo: Repo, haves: readonly string[], shallowLines: readonl
     if (!object) continue;
     seen.add(oid);
     if (object.type === 'commit') {
-      const commit = parseCommit(object.data);
-      queue.push(commit.tree);
-      if (!shallow.has(oid)) for (const parent of commit.parents) queue.push(parent);
+      const commit = parseCommitCached(repo, oid);
+      if (commit) {
+        queue.push(commit.tree);
+        if (!shallow.has(oid)) for (const parent of commit.parents) queue.push(parent);
+      }
     } else if (object.type === 'tag') {
       queue.push(parseTag(object.data).object);
     } else if (object.type === 'tree') {
@@ -437,9 +449,9 @@ function selectFetchObjects(repo: Repo, args: FetchArgs): FetchSelection {
   while (queue.length) {
     const current = queue.shift()!;
     const depth = distance.get(current)!;
-    const object = repo.objects.get(current);
-    if (!object || object.type !== 'commit') continue;
-    for (const parent of parseCommit(object.data).parents) {
+    const view = parseCommitCached(repo, current);
+    if (!view) continue;
+    for (const parent of view.parents) {
       if (!distance.has(parent)) {
         distance.set(parent, depth + 1);
         queue.push(parent);
@@ -455,20 +467,20 @@ function selectFetchObjects(repo: Repo, args: FetchArgs): FetchSelection {
   const boundary: string[] = [];
   if (args.depth !== null) {
     for (const oid of includedCommits) {
-      const object = repo.objects.get(oid);
-      if (!object || object.type !== 'commit') continue;
-      const cut = parseCommit(object.data).parents.some((parent) => !includedCommits.has(parent) && !haveCommits.has(parent));
+      const view = parseCommitCached(repo, oid);
+      if (!view) continue;
+      const cut = view.parents.some((parent) => !includedCommits.has(parent) && !haveCommits.has(parent));
       if (cut) boundary.push(oid);
     }
   }
   const unshallow: string[] = [];
   for (const oid of args.shallowLines) {
     if (boundary.includes(oid)) continue;
-    const object = repo.objects.get(oid);
-    if (!object || object.type !== 'commit') continue;
+    const view = parseCommitCached(repo, oid);
+    if (!view) continue;
     // A boundary commit stops being shallow once one of its parents is delivered in this
     // fetch: the client's history now extends past it.
-    const parentDelivered = parseCommit(object.data).parents.some((parent) => includedCommits.has(parent));
+    const parentDelivered = view.parents.some((parent) => includedCommits.has(parent));
     if (parentDelivered) unshallow.push(oid);
   }
   const chosen = new Set<string>();
@@ -476,9 +488,9 @@ function selectFetchObjects(repo: Repo, args: FetchArgs): FetchSelection {
     // The commit itself plus its own tree closure — never its ancestors' trees, which the
     // client either has (haves) or must not be sent (beyond the shallow cut).
     chosen.add(oid);
-    const object = repo.objects.get(oid);
-    if (object && object.type === 'commit') {
-      for (const reachable of reachableObjects(repo, [parseCommit(object.data).tree])) chosen.add(reachable);
+    const view = parseCommitCached(repo, oid);
+    if (view) {
+      for (const reachable of reachableObjects(repo, [view.tree])) chosen.add(reachable);
     }
   }
   // Tag objects on the want chain are part of the transfer.
@@ -602,6 +614,7 @@ function receivePack(forge: Forge, repo: Repo, body: Buffer): Buffer {
     }
     if (command.newOid === ZERO_OID) {
       repo.refs.delete(command.ref);
+      touchRefs(repo);
       reportLines.push(`ok ${command.ref}\n`);
       continue;
     }
@@ -617,12 +630,13 @@ function receivePack(forge: Forge, repo: Repo, body: Buffer): Buffer {
     if (current !== undefined && current !== command.newOid) {
       const currentCommit = peelToCommit(repo, current);
       const newCommit = peelToCommit(repo, command.newOid);
-      if (currentCommit !== null && newCommit !== null && !ancestorSet(repo, newCommit).has(currentCommit)) {
+      if (currentCommit !== null && newCommit !== null && !isAncestor(repo, currentCommit, newCommit)) {
         reportLines.push(`ng ${command.ref} non-fast-forward\n`);
         continue;
       }
     }
     repo.refs.set(command.ref, command.newOid);
+    touchRefs(repo);
     reportLines.push(`ok ${command.ref}\n`);
   }
   const report = Buffer.concat([...reportLines.map((line) => pktLine(line)), PKT_FLUSH]);

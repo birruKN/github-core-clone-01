@@ -17,19 +17,21 @@ import {
   diffFileMaps,
   flattenTree,
   getObject,
+  invalidateIssueView,
   mergeBase,
-  parseCommit,
+  parseCommitCached,
   parseTree,
   peelToCommit,
   resolveRef,
   squashMerge,
   storeObject,
+  touchRefs,
   type Forge,
   type IssueRec,
   type PullRec,
   type Repo,
 } from './store.ts';
-import { authorized, originOf, sendEmpty, sendJson } from './http.ts';
+import { authorized, originOf, sendEmpty, sendJson, sendJsonText } from './http.ts';
 
 type Json = Record<string, unknown>;
 
@@ -71,6 +73,17 @@ function issueView(repo: Repo, issue: IssueRec): Json {
     user: { login: repo.owner },
     comments: issue.comments.length,
   };
+}
+
+/**
+ * The issue's REST body as JSON text, memoized on the record. The view depends only on the
+ * record and the repo's label colors; mutation sites clear the memo (invalidateIssueView),
+ * and label creation clears every memo in the repo, so a hit is byte-identical to a fresh
+ * JSON.stringify(issueView(...)).
+ */
+function issueViewText(repo: Repo, issue: IssueRec): string {
+  if (issue.viewText === undefined) issue.viewText = JSON.stringify(issueView(repo, issue));
+  return issue.viewText;
 }
 
 function pullView(repo: Repo, pull: PullRec): Json {
@@ -183,6 +196,7 @@ function handleRepoRoute(
         return;
       }
       repo.refs.set(full, sha);
+      touchRefs(repo);
       sendJson(res, 201, { ref: full, object: { sha, type: 'commit' } });
       return;
     }
@@ -238,10 +252,9 @@ function handleRepoRoute(
     const seen = new Set<string>();
     const walk = (oid: string): void => {
       if (seen.has(oid) || commits.length >= 100) return;
-      const object = getObject(repo, oid);
-      if (!object || object.type !== 'commit') return;
+      const commit = parseCommitCached(repo, oid);
+      if (!commit) return;
       seen.add(oid);
-      const commit = parseCommit(object.data);
       commits.push({
         sha: oid,
         commit: {
@@ -271,6 +284,9 @@ function handleRepoRoute(
       return;
     }
     repo.labels.set(name, { name, color });
+    // A new label can change the color an existing issue's view reports (the 'ededed'
+    // fallback), so every cached issue view in this repo is stale now.
+    for (const issue of repo.issues.values()) invalidateIssueView(issue);
     sendJson(res, 201, { name, color });
     return;
   }
@@ -472,7 +488,7 @@ function handleIssues(
         return;
       }
       const issue = createIssueRecord(forge, repo, { title, body: text, labels });
-      sendJson(res, 201, issueView(repo, issue));
+      sendJsonText(res, 201, issueViewText(repo, issue));
       return;
     }
     if (method === 'GET') {
@@ -486,7 +502,10 @@ function handleIssues(
       } else {
         issues.sort((a, b) => a.seq - b.seq);
       }
-      sendJson(res, 200, paginate(issues, query).map((issue) => issueView(repo, issue)));
+      // The array body is the per-issue serializations joined exactly as JSON.stringify
+      // would join them, so the composed text is byte-identical to stringifying the views.
+      const page = paginate(issues, query).map((issue) => issueViewText(repo, issue));
+      sendJsonText(res, 200, `[${page.join(',')}]`);
       return;
     }
     notFound(res);
@@ -501,7 +520,7 @@ function handleIssues(
   }
   if (rest.length === 1) {
     if (method === 'GET') {
-      sendJson(res, 200, issueView(repo, issue));
+      sendJsonText(res, 200, issueViewText(repo, issue));
       return;
     }
     if (method === 'PATCH') {
@@ -517,7 +536,8 @@ function handleIssues(
         }
         issue.labels = labels;
       }
-      sendJson(res, 200, issueView(repo, issue));
+      invalidateIssueView(issue);
+      sendJsonText(res, 200, issueViewText(repo, issue));
       return;
     }
     notFound(res);
@@ -528,6 +548,7 @@ function handleIssues(
       const text = typeof body.body === 'string' ? body.body : '';
       const comment = { id: forge.entityId(), body: text, seq: issue.comments.length };
       issue.comments.push(comment);
+      invalidateIssueView(issue);
       sendJson(res, 201, { id: comment.id, body: comment.body, user: { login: repo.owner } });
       return;
     }

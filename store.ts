@@ -107,6 +107,12 @@ export function parseCommit(data: Buffer): CommitView {
   return view;
 }
 
+/**
+ * parseCommit memoized per repository (defined below, next to the Repo record): commit
+ * objects are immutable and content-addressed, so a parsed view can never go stale. The
+ * shared view is read-only for callers — every existing caller only reads its fields.
+ */
+
 export function buildCommit(fields: {
   tree: string;
   parents: readonly string[];
@@ -163,6 +169,16 @@ export interface IssueRec {
   labels: string[];
   comments: CommentRec[];
   seq: number;
+  /** Cached REST serialization of this issue (JSON text, no trailing newline). The REST view
+   *  is a pure function of the record plus the repo's label colors, so the cached text is
+   *  byte-identical to a fresh serialization; every mutation site clears it via
+   *  invalidateIssueView. */
+  viewText?: string;
+}
+
+/** Drop an issue's cached REST serialization after any change to the record. */
+export function invalidateIssueView(issue: IssueRec): void {
+  issue.viewText = undefined;
 }
 
 export interface PullRec {
@@ -198,6 +214,17 @@ export interface Repo {
   seq: number;
   /** Memoized ancestor sets per commit (content-addressed, so they never go stale). */
   ancestorCache: Map<string, Set<string>>;
+  /** Memoized parseCommit views per commit (same immutability argument). */
+  commitParseCache: Map<string, CommitView>;
+  /** Bumped on every ref mutation; keys the ls-refs reply cache below. */
+  refsVersion: number;
+  /** The last ls-refs reply built for this repo, with the cache key it answers. */
+  lsRefsCache: { key: string; body: Buffer } | null;
+}
+
+/** Record a ref mutation: anything derived from the ref set (ls-refs replies) is stale now. */
+export function touchRefs(repo: Repo): void {
+  repo.refsVersion += 1;
 }
 
 const CLOCK_EPOCH = 1_735_689_600; // 2025-01-01T00:00:00Z, the fixture epoch's neighbourhood
@@ -245,6 +272,9 @@ export class Forge {
       nextNumber: 1,
       seq: this.repos.size,
       ancestorCache: new Map(),
+      commitParseCache: new Map(),
+      refsVersion: 0,
+      lsRefsCache: null,
     };
     this.nextRepoId += 1;
     this.repos.set(key, repo);
@@ -328,9 +358,9 @@ export function commitAncestors(repo: Repo, tip: string): Map<string, number> {
   while (queue.length) {
     const current = queue.shift()!;
     const depth = depths.get(current)!;
-    const object = repo.objects.get(current);
-    if (!object || object.type !== 'commit') continue;
-    for (const parent of parseCommit(object.data).parents) {
+    const view = parseCommitCached(repo, current);
+    if (!view) continue;
+    for (const parent of view.parents) {
       if (!depths.has(parent)) {
         depths.set(parent, depth + 1);
         queue.push(parent);
@@ -338,6 +368,17 @@ export function commitAncestors(repo: Repo, tip: string): Map<string, number> {
     }
   }
   return depths;
+}
+
+/** parseCommit through the repo's memo; null when the id is not a stored commit. */
+export function parseCommitCached(repo: Repo, oid: string): CommitView | null {
+  const cached = repo.commitParseCache.get(oid);
+  if (cached) return cached;
+  const object = repo.objects.get(oid);
+  if (!object || object.type !== 'commit') return null;
+  const view = parseCommit(object.data);
+  if (repo.commitParseCache.size < 20000) repo.commitParseCache.set(oid, view);
+  return view;
 }
 
 /**
@@ -351,9 +392,9 @@ export function ancestorSet(repo: Repo, tip: string): Set<string> {
   const cached = repo.ancestorCache.get(start);
   if (cached) return cached;
   const result = new Set<string>([start]);
-  const object = repo.objects.get(start);
-  if (object && object.type === 'commit') {
-    for (const parent of parseCommit(object.data).parents) {
+  const view = parseCommitCached(repo, start);
+  if (view) {
+    for (const parent of view.parents) {
       for (const ancestor of ancestorSet(repo, parent)) result.add(ancestor);
     }
   }
@@ -361,11 +402,32 @@ export function ancestorSet(repo: Repo, tip: string): Set<string> {
   return result;
 }
 
+/**
+ * Reachability of `ancestor` from `descendant` by parent walking with early exit: the
+ * common fast-forward question ("is the old tip on the new tip's first steps back?") is
+ * answered in a step or two, where building the full ancestor set costs O(history) with a
+ * set union per commit. A visited set keeps merge-heavy histories linear.
+ */
 export function isAncestor(repo: Repo, ancestor: string, descendant: string): boolean {
   const anc = peelToCommit(repo, ancestor);
   const desc = peelToCommit(repo, descendant);
   if (anc === null || desc === null) return false;
-  return ancestorSet(repo, desc).has(anc);
+  if (anc === desc) return true;
+  const seen = new Set<string>([desc]);
+  const queue = [desc];
+  while (queue.length > 0) {
+    const current = queue.pop() as string;
+    const view = parseCommitCached(repo, current);
+    if (!view) continue;
+    for (const parent of view.parents) {
+      if (parent === anc) return true;
+      if (!seen.has(parent)) {
+        seen.add(parent);
+        queue.push(parent);
+      }
+    }
+  }
+  return false;
 }
 
 /** The best common ancestor of two commits (the one with the smallest combined depth). */
@@ -398,9 +460,11 @@ export function reachableObjects(repo: Repo, tips: Iterable<string>): Set<string
     if (!object) continue;
     seen.add(oid);
     if (object.type === 'commit') {
-      const commit = parseCommit(object.data);
-      queue.push(commit.tree);
-      for (const parent of commit.parents) queue.push(parent);
+      const commit = parseCommitCached(repo, oid);
+      if (commit) {
+        queue.push(commit.tree);
+        for (const parent of commit.parents) queue.push(parent);
+      }
     } else if (object.type === 'tag') {
       queue.push(parseTag(object.data).object);
     } else if (object.type === 'tree') {
@@ -467,9 +531,8 @@ export function treeFromFiles(repo: Repo, files: ReadonlyMap<string, FileEntry>)
 
 /** The tree of a commit object, or null. */
 export function commitTree(repo: Repo, commitOid: string): string | null {
-  const object = repo.objects.get(commitOid);
-  if (!object || object.type !== 'commit') return null;
-  return parseCommit(object.data).tree;
+  const view = parseCommitCached(repo, commitOid);
+  return view ? view.tree : null;
 }
 
 /**
@@ -505,6 +568,7 @@ export function commitFiles(
     }),
   );
   repo.refs.set(ref, commit);
+  touchRefs(repo);
   return commit;
 }
 
@@ -640,6 +704,7 @@ export function squashMerge(forge: Forge, repo: Repo, pull: PullRec): MergeOutco
     buildCommit({ tree, parents: [baseCommit], message, author: identity, committer: identity, timestamp: forge.tick() }),
   );
   repo.refs.set(`refs/heads/${pull.baseRef}`, sha);
+  touchRefs(repo);
   pull.state = 'closed';
   pull.merged = true;
   pull.mergedAt = forge.isoNow();

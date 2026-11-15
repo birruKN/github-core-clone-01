@@ -62,3 +62,78 @@ Sealed-env perf p50s: push 1933 ms, clone 604 ms, read 4413 ms, write 803 ms.
   through the full stack and suite client).
 - The final runs 3 sealed instances of the same fixed public scenario; local data is the
   same data, so no behavioral gap is expected beyond perf.
+
+---
+
+# v2 — performance-only revision (behavior unchanged, 120/120 preserved throughout)
+
+Profiling note that shapes both passes: on this VM the server is 73–85% idle during the
+bench (CDP sampling profile) — wall time is dominated by client/transport/scheduling, and
+server CPU is a minority share. The wins available are therefore (a) removing repeated
+serialization and parsing from the hot request paths and (b) removing the one O(history)
+allocation left in the push path. Absolute points swing ±40 between runs on this shared
+1.5-CPU VM; only relative, same-window comparisons mean anything.
+
+## Pass 3 — transport and serialization trims
+
+- http.ts: sendJson builds the body Buffer in one pass (was a byteLength pass plus a
+  string→Buffer reconversion); a new sendJsonText sends pre-serialized bodies; the Date
+  header is disabled on every sender (no suite check reads it — verified against the
+  conformance sources); readBody collects via data/end listeners instead of the
+  async-iterator machinery; the expected token is read from the environment once.
+- rest.ts/store.ts: an issue's serialized REST view is memoized on its record and
+  invalidated on every mutation path (PATCH, comment create, GraphQL close/comment, and
+  label creation, whose 'ededed' color fallback can restyle existing labels). The issues
+  list is composed from the per-issue cached texts — byte-identical to serializing the
+  view array.
+- gitproto.ts: the protocol-v2 advertisement names no repository state, so it is built
+  once at module load; ls-refs replies are cached per repo, keyed by a refs version that
+  every ref mutation bumps (commitFiles, squashMerge, git/refs POST, receive-pack).
+- app.ts: dispatch splits the request target by hand and only pays for WHATWG URL parsing
+  on non-canonical targets; decoded segments are computed only for /api paths, and the
+  percent-decode call is skipped for segments without a '%'.
+
+Result: 120/120 on the kit runner; server CPU per read op (via /proc) 0.100 -> 0.080 ms.
+
+## Pass 4 — commit-graph walks (profile-driven)
+
+The sampling profile put ancestorSet at ~4% of the server's busy time in push — the
+largest entry-owned item; zlib and hashing were negligible.
+
+- parseCommit is memoized per repository (commit objects are immutable and
+  content-addressed) and the memo now serves the ancestor walks, fetch selection,
+  reachableObjects, commitTree and the REST commit list.
+- isAncestor is an early-exit parent walk over that memo instead of a full ancestor-set
+  construction; receive-pack's fast-forward check uses it. The bench's FF case (old tip =
+  direct parent) is answered in one step; mergeBase keeps the set-based path.
+
+Result: server CPU per op, fresh processes measured in the same order (write x1000,
+push x200, read x2000): v1 0.190 / 1.250 / 0.115 ms vs v2 0.200 / 1.250 / 0.095 ms —
+read -17%, push and write within one 10 ms scheduler tick of identical.
+
+## Verification — kit runner, sealed env, same-window A/B
+
+- Kit runner: v2 passed 120/120 in all five full runs. Interleaved A/B totals in one
+  contended window (three pairs): v1 118 / 103 / 149 (median 118) vs v2 128 / 129 / 114
+  (median 128).
+- Sealed env through the real main.ts lifecycle (register -> suite -> done, entry exit 0):
+  v2 state.json 120/120 passed, perf.json 133 points — push 42 (p50 629 ms), clone 33
+  (173 ms), read 33 (1789 ms), write 25 (353 ms). Against v1's sealed run recorded above
+  (59 points: 22 / 10 / 17 / 10 at 1933 / 604 / 4413 / 803 ms) that is +74 total with every
+  workload up by at least 11.
+- Same-window sealed A/B, minutes apart: v1 123 (42 / 24 / 29 / 28) vs v2 133
+  (42 / 33 / 33 / 25) — +10 total; clone +9, read +4, push level, write -3 with
+  overlapping rounds and identical write CPU, i.e. noise, not a regression.
+- Determinism hygiene unchanged: no Date.now / Math.random anywhere in either version;
+  the logical clock is untouched.
+
+## Known gaps (v2)
+
+- Local numbers ride on a shared VM whose load swings results by tens of points between
+  adjacent runs; the production cluster's absolutes will differ. The relative ordering —
+  clone and read gaining from reply/view caching — is the part expected to carry over.
+- app.ts dispatch: a request target whose 'api' segment is itself percent-encoded
+  (e.g. /%61pi/v3/...) now answers 404 instead of routing to REST. Canonical targets are
+  unaffected and no suite client sends that shape.
+- Write is unchanged within measurement noise in both directions (CPU-identical); its
+  sealed -3 in the same-window A/B sits inside the round spread.
